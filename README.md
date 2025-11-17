@@ -253,13 +253,18 @@ RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0
 
 The `--streams N` option creates N parallel TCP connections for each UDP client connection. Packets are distributed across these streams using round-robin, which can significantly improve throughput on multi-core systems.
 
-**Current Limitations:**
-- The remote UDP server will see packets arriving from N different source ports (one per TCP stream)
-- This works well for protocols that can handle multiple source ports, but is not suitable for protocols like WireGuard that require a consistent source IP:port
-- Each TCP stream is handled independently by the server
+**How It Works:**
+- Client creates N TCP connections for each UDP client, each tagged with a unique stream-id
+- Server automatically detects and groups related streams by their stream-id
+- All streams in a group share a single UDP socket on the server side
+- The remote UDP server sees all packets from a single, consistent source IP:port
+- Compatible with all UDP protocols, including WireGuard
 
-**Future Enhancement:**
-Server-side stream grouping is planned, which will merge multiple TCP streams back into a single UDP connection with consistent source port. This will make the feature fully compatible with all UDP protocols.
+**Benefits:**
+- Improved throughput by parallelizing TCP processing across multiple cores
+- Maintains protocol compatibility - remote server sees single UDP source
+- Automatic stream grouping on server, no configuration needed
+- Falls back to single-stream for backward compatibility
 
 <details>
   <summary>IPv6 specific config</summary>
@@ -367,8 +372,7 @@ Writeup on some of the techniques used in Phantun to achieve this performance re
 
 # Future plans
 
-* ~~Load balancing a single UDP stream into multiple TCP streams~~ - Partially implemented (client-side only, see `--streams` option)
-  * TODO: Server-side stream grouping for single UDP source port
+* ~~Load balancing a single UDP stream into multiple TCP streams~~ - **Fully implemented!** (see `--streams` option)
 * Integration tests
 * Auto insertion/removal of required firewall rules
 

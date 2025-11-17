@@ -13,27 +13,65 @@ use tokio::sync::{Notify, RwLock};
 use tokio::time;
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-use phantun::UDP_TTL;
+use phantun::{MULTISTREAM_HEADER_LEN, MULTISTREAM_MAGIC, MULTISTREAM_VERSION, UDP_TTL};
+
+/// Build a multi-stream handshake packet
+/// Format: [MAGIC(4)][VERSION(1)][STREAM_ID(16)][STREAM_INDEX(1)][TOTAL_STREAMS(1)][USER_PACKET]
+fn build_multistream_handshake(
+    stream_id: &Uuid,
+    stream_index: u8,
+    total_streams: u8,
+    user_handshake: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(MULTISTREAM_HEADER_LEN + user_handshake.map_or(0, |p| p.len()));
+
+    // Magic number
+    packet.extend_from_slice(MULTISTREAM_MAGIC);
+
+    // Version
+    packet.push(MULTISTREAM_VERSION);
+
+    // Stream ID (UUID as bytes)
+    packet.extend_from_slice(stream_id.as_bytes());
+
+    // Stream index
+    packet.push(stream_index);
+
+    // Total streams
+    packet.push(total_streams);
+
+    // Append user's custom handshake packet if provided
+    if let Some(user_pkt) = user_handshake {
+        packet.extend_from_slice(user_pkt);
+    }
+
+    packet
+}
 
 /// Manages multiple TCP streams for a single UDP connection
 ///
 /// This struct enables load balancing of UDP packets across multiple TCP connections,
 /// which can improve throughput on multi-core systems by parallelizing the TCP processing.
 ///
-/// ## Current Implementation (Phase 1):
-/// - Each TCP stream is independent on the server side
-/// - Server creates separate UDP sockets for each stream
-/// - Remote UDP server sees packets from different source ports
-/// - Works for protocols that can handle multiple source ports
+/// ## Implementation:
+/// - Each UDP connection can use N parallel TCP streams (configured via --streams)
+/// - Client generates a unique stream-id (UUID) for each multi-stream connection
+/// - Stream-id is transmitted in handshake packets to identify related streams
+/// - Server automatically groups streams by stream-id
+/// - All streams in a group share a single UDP socket on the server side
+/// - Remote UDP server sees packets from a single, consistent source IP:port
+/// - Compatible with all UDP protocols, including WireGuard
 ///
-/// ## Future Enhancement (Phase 2):
-/// TODO: Implement stream grouping protocol
-/// - Add stream-id mechanism to identify related TCP connections
-/// - Server-side connection grouping by stream-id
-/// - Single shared UDP socket per stream group on server
-/// - This will make all packets appear from a single source to the remote UDP server
-/// - Required for protocols like WireGuard that need consistent source IP:port
+/// ## Protocol:
+/// Multi-stream handshake packet format:
+/// [MAGIC(4)][VERSION(1)][STREAM_ID(16)][STREAM_INDEX(1)][TOTAL_STREAMS(1)][USER_PACKET...]
+/// - MAGIC: "PMTS" (Phantun Multi-Stream)
+/// - VERSION: Protocol version (currently 1)
+/// - STREAM_ID: UUID identifying the stream group
+/// - STREAM_INDEX: Index of this stream (0-based)
+/// - TOTAL_STREAMS: Total number of streams in the group
 struct MultiStream {
     sockets: Vec<Arc<Socket>>,
     next_socket: AtomicUsize,
@@ -255,6 +293,17 @@ async fn main() -> io::Result<()> {
 
             info!("New UDP client from {}", udp_remote_addr);
 
+            // Generate stream ID for multi-stream connections
+            let stream_id = if num_streams > 1 {
+                Some(Uuid::new_v4())
+            } else {
+                None
+            };
+
+            if let Some(ref sid) = stream_id {
+                info!("Generated stream ID {} for multi-stream connection", sid);
+            }
+
             // Create multiple TCP connections for load balancing
             let mut sockets = Vec::with_capacity(num_streams);
             for i in 0..num_streams {
@@ -267,13 +316,36 @@ async fn main() -> io::Result<()> {
 
                 let sock = Arc::new(sock.unwrap());
 
-                // Send handshake packet on all streams
-                if let Some(ref p) = handshake_packet {
-                    if sock.send(p).await.is_none() {
+                // Send handshake packet
+                // For multi-stream: send stream-id header + optional user packet
+                // For single-stream: send user packet only (backward compatible)
+                let handshake_to_send = if let Some(ref sid) = stream_id {
+                    // Multi-stream mode: build protocol header
+                    build_multistream_handshake(
+                        sid,
+                        i as u8,
+                        num_streams as u8,
+                        handshake_packet.as_deref(),
+                    )
+                } else if let Some(ref p) = handshake_packet {
+                    // Single-stream mode with user packet
+                    p.clone()
+                } else {
+                    // No handshake packet needed
+                    Vec::new()
+                };
+
+                if !handshake_to_send.is_empty() {
+                    if sock.send(&handshake_to_send).await.is_none() {
                         error!("Failed to send handshake packet to remote on stream {}/{}, closing connection.", i + 1, num_streams);
                         break;
                     }
-                    debug!("Sent handshake packet to: {} (stream {}/{})", sock, i + 1, num_streams);
+                    if stream_id.is_some() {
+                        debug!("Sent multi-stream handshake to: {} (stream {}/{}, ID: {})",
+                               sock, i + 1, num_streams, stream_id.unwrap());
+                    } else {
+                        debug!("Sent handshake packet to: {}", sock);
+                    }
                 }
 
                 sockets.push(sock);
