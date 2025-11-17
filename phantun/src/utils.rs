@@ -53,9 +53,9 @@ pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
     udp_sock.try_into().unwrap()
 }
 
-/// Similiar to `UdpSocket::recv_from()`, but returns a 3rd value `IPAddr`
+/// Similar to `UdpSocket::recv_from()`, but returns a 3rd value `IPAddr`
 /// which corresponds to where the UDP datagram was destined to, this is useful
-/// for disambigous when socket can receive on multiple IP address
+/// for disambiguating when socket can receive on multiple IP address
 /// or interfaces.
 pub async fn udp_recv_pktinfo(
     sock: &UdpSocket,
