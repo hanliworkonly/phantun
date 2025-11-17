@@ -20,5 +20,6 @@ tokio-tun = "0"
 num_cpus = "1"
 neli = "0"
 nix = { version = "0", features = ["net", "uio", "socket"] }
+uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true }
 log = { workspace = true }

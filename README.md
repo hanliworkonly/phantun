@@ -243,6 +243,24 @@ Or use host name with `--remote`:
 RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote example.com:4567
 ```
 
+#### Load Balancing with Multiple TCP Streams
+
+Phantun Client supports load balancing a single UDP connection across multiple TCP streams for improved throughput:
+
+```
+RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --streams 4
+```
+
+The `--streams N` option creates N parallel TCP connections for each UDP client connection. Packets are distributed across these streams using round-robin, which can significantly improve throughput on multi-core systems.
+
+**Current Limitations:**
+- The remote UDP server will see packets arriving from N different source ports (one per TCP stream)
+- This works well for protocols that can handle multiple source ports, but is not suitable for protocols like WireGuard that require a consistent source IP:port
+- Each TCP stream is handled independently by the server
+
+**Future Enhancement:**
+Server-side stream grouping is planned, which will merge multiple TCP streams back into a single UDP connection with consistent source port. This will make the feature fully compatible with all UDP protocols.
+
 <details>
   <summary>IPv6 specific config</summary>
 
@@ -349,7 +367,8 @@ Writeup on some of the techniques used in Phantun to achieve this performance re
 
 # Future plans
 
-* Load balancing a single UDP stream into multiple TCP streams
+* ~~Load balancing a single UDP stream into multiple TCP streams~~ - Partially implemented (client-side only, see `--streams` option)
+  * TODO: Server-side stream grouping for single UDP source port
 * Integration tests
 * Auto insertion/removal of required firewall rules
 

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
@@ -14,6 +15,49 @@ use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
+
+/// Manages multiple TCP streams for a single UDP connection
+///
+/// This struct enables load balancing of UDP packets across multiple TCP connections,
+/// which can improve throughput on multi-core systems by parallelizing the TCP processing.
+///
+/// ## Current Implementation (Phase 1):
+/// - Each TCP stream is independent on the server side
+/// - Server creates separate UDP sockets for each stream
+/// - Remote UDP server sees packets from different source ports
+/// - Works for protocols that can handle multiple source ports
+///
+/// ## Future Enhancement (Phase 2):
+/// TODO: Implement stream grouping protocol
+/// - Add stream-id mechanism to identify related TCP connections
+/// - Server-side connection grouping by stream-id
+/// - Single shared UDP socket per stream group on server
+/// - This will make all packets appear from a single source to the remote UDP server
+/// - Required for protocols like WireGuard that need consistent source IP:port
+struct MultiStream {
+    sockets: Vec<Arc<Socket>>,
+    next_socket: AtomicUsize,
+}
+
+impl MultiStream {
+    fn new(sockets: Vec<Arc<Socket>>) -> Arc<Self> {
+        Arc::new(MultiStream {
+            sockets,
+            next_socket: AtomicUsize::new(0),
+        })
+    }
+
+    /// Get the next socket using round-robin distribution
+    fn get_next_socket(&self) -> &Arc<Socket> {
+        let index = self.next_socket.fetch_add(1, Ordering::Relaxed) % self.sockets.len();
+        &self.sockets[index]
+    }
+
+    /// Get all sockets
+    fn get_all_sockets(&self) -> &[Arc<Socket>] {
+        &self.sockets
+    }
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -101,6 +145,15 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("streams")
+                .long("streams")
+                .required(false)
+                .value_name("N")
+                .help("Number of TCP streams to use for load balancing each UDP connection (default: 1). \
+                      Using multiple streams can improve throughput on multi-core systems.")
+                .default_value("1")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -148,6 +201,21 @@ async fn main() -> io::Result<()> {
         .map(fs::read)
         .transpose()?;
 
+    let num_streams: usize = matches
+        .get_one::<String>("streams")
+        .unwrap()
+        .parse()
+        .expect("streams must be a positive integer");
+
+    if num_streams == 0 {
+        panic!("streams must be at least 1");
+    }
+
+    if num_streams > 1 {
+        info!("Multi-stream mode enabled: {} TCP streams per UDP connection", num_streams);
+        info!("Note: Remote UDP server will see packets from {} different source ports", num_streams);
+    }
+
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
@@ -167,7 +235,7 @@ async fn main() -> io::Result<()> {
     info!("Created TUN device {}", tun[0].name());
 
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
-    let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
+    let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<MultiStream>>::new()));
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
 
@@ -180,39 +248,57 @@ async fn main() -> io::Result<()> {
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
-            if let Some(sock) = connections.read().await.get(&udp_remote_addr) {
-                sock.send(&buf_r[..size]).await;
+            if let Some(multi_stream) = connections.read().await.get(&udp_remote_addr) {
+                multi_stream.get_next_socket().send(&buf_r[..size]).await;
                 continue;
             }
 
             info!("New UDP client from {}", udp_remote_addr);
-            let sock = stack.connect(remote_addr).await;
-            if sock.is_none() {
-                error!("Unable to connect to remote {}", remote_addr);
-                continue;
-            }
 
-            let sock = Arc::new(sock.unwrap());
-            if let Some(ref p) = handshake_packet {
-                if sock.send(p).await.is_none() {
-                    error!("Failed to send handshake packet to remote, closing connection.");
-                    continue;
+            // Create multiple TCP connections for load balancing
+            let mut sockets = Vec::with_capacity(num_streams);
+            for i in 0..num_streams {
+                let sock = stack.connect(remote_addr).await;
+                if sock.is_none() {
+                    error!("Unable to connect to remote {} (stream {}/{})", remote_addr, i + 1, num_streams);
+                    // Clean up any sockets we already created
+                    break;
                 }
 
-                debug!("Sent handshake packet to: {}", sock);
+                let sock = Arc::new(sock.unwrap());
+
+                // Send handshake packet on all streams
+                if let Some(ref p) = handshake_packet {
+                    if sock.send(p).await.is_none() {
+                        error!("Failed to send handshake packet to remote on stream {}/{}, closing connection.", i + 1, num_streams);
+                        break;
+                    }
+                    debug!("Sent handshake packet to: {} (stream {}/{})", sock, i + 1, num_streams);
+                }
+
+                sockets.push(sock);
             }
 
-            // send first packet
-            if sock.send(&buf_r[..size]).await.is_none() {
+            // Check if all connections were successful
+            if sockets.len() != num_streams {
+                error!("Failed to create all {} streams, only {} succeeded. Skipping this connection.", num_streams, sockets.len());
                 continue;
             }
 
+            info!("Created {} TCP streams for UDP client {}", num_streams, udp_remote_addr);
+
+            // Send first packet on first stream (round-robin will start from stream 0)
+            if sockets[0].send(&buf_r[..size]).await.is_none() {
+                continue;
+            }
+
+            let multi_stream = MultiStream::new(sockets);
             assert!(connections
                 .write()
                 .await
-                .insert(udp_remote_addr, sock.clone())
+                .insert(udp_remote_addr, multi_stream.clone())
                 .is_none());
-            debug!("inserted fake TCP socket into connection table");
+            debug!("inserted {} fake TCP sockets into connection table", num_streams);
 
             // spawn "fastpath" UDP socket and task, this will offload main task
             // from forwarding UDP packets
@@ -220,80 +306,98 @@ async fn main() -> io::Result<()> {
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
 
+            // Create shared UDP socket for this connection
+            let bind_addr = match (udp_remote_addr, udp_local_addr) {
+                (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
+                    SocketAddr::V4(SocketAddrV4::new(
+                        udp_local_ipv4,
+                        local_addr.port(),
+                    ))
+                }
+                (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
+                    SocketAddr::V6(SocketAddrV6::new(
+                        udp_local_ipv6,
+                        local_addr.port(),
+                        udp_remote_addr.flowinfo(),
+                        udp_remote_addr.scope_id(),
+                    ))
+                }
+                (_, _) => {
+                    panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                }
+            };
+            let shared_udp_sock = Arc::new(new_udp_reuseport(bind_addr));
+            shared_udp_sock.connect(udp_remote_addr).await.unwrap();
+
+            // Spawn workers for UDP -> TCP (using round-robin across streams)
             for i in 0..num_cpus {
-                let sock = sock.clone();
+                let multi_stream = multi_stream.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
+                let udp_sock = shared_udp_sock.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
-                    let mut buf_tcp = [0u8; MAX_PACKET_LEN];
-                    // Always reply from the same address that the peer used to communicate with
-                    // us. This avoids a frequent problem with IPv6 privacy extensions when we
-                    // erroneously bind to wrong short-lived temporary address even if the peer
-                    // explicitly used a persistent address to communicate to us.
-                    //
-                    // To do so, first bind to (<incoming packet dst_ip>, <local addr port>), and then
-                    // connect to (<incoming packet src_ip>, <incoming packet src_port>).
-                    let bind_addr = match (udp_remote_addr, udp_local_addr) {
-                        (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
-                        }
-                        (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
-                            SocketAddr::V6(SocketAddrV6::new(
-                                udp_local_ipv6,
-                                local_addr.port(),
-                                udp_remote_addr.flowinfo(),
-                                udp_remote_addr.scope_id(),
-                            ))
-                        }
-                        (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
-                        }
-                    };
-                    let udp_sock = new_udp_reuseport(bind_addr);
-                    udp_sock.connect(udp_remote_addr).await.unwrap();
 
                     loop {
                         tokio::select! {
                             Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
-                                    debug!("removed fake TCP socket from connections table");
+                                // Distribute packets across TCP streams using round-robin
+                                if multi_stream.get_next_socket().send(&buf_udp[..size]).await.is_none() {
+                                    debug!("failed to send to TCP stream, closing connection");
                                     quit.cancel();
                                     return;
                                 }
-
-                                packet_received.notify_one();
-                            },
-                            res = sock.recv(&mut buf_tcp) => {
-                                match res {
-                                    Some(size) => {
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                quit.cancel();
-                                                return;
-                                            }
-                                    },
-                                    None => {
-                                        debug!("removed fake TCP socket from connections table");
-                                        quit.cancel();
-                                        return;
-                                    },
-                                }
-
                                 packet_received.notify_one();
                             },
                             _ = quit.cancelled() => {
-                                debug!("worker {} terminated", i);
+                                debug!("UDP->TCP worker {} terminated", i);
                                 return;
                             },
                         };
                     }
                 });
+            }
+
+            // Spawn workers for each TCP stream to handle TCP -> UDP
+            for (stream_idx, sock) in multi_stream.get_all_sockets().iter().enumerate() {
+                for i in 0..num_cpus {
+                    let sock = sock.clone();
+                    let quit = quit.clone();
+                    let packet_received = packet_received.clone();
+                    let udp_sock = shared_udp_sock.clone();
+
+                    tokio::spawn(async move {
+                        let mut buf_tcp = [0u8; MAX_PACKET_LEN];
+
+                        loop {
+                            tokio::select! {
+                                res = sock.recv(&mut buf_tcp) => {
+                                    match res {
+                                        Some(size) => {
+                                            if size > 0
+                                                && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                                    error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                                    quit.cancel();
+                                                    return;
+                                                }
+                                        },
+                                        None => {
+                                            debug!("TCP stream {} closed", stream_idx);
+                                            quit.cancel();
+                                            return;
+                                        },
+                                    }
+                                    packet_received.notify_one();
+                                },
+                                _ = quit.cancelled() => {
+                                    debug!("TCP->UDP worker {} for stream {} terminated", i, stream_idx);
+                                    return;
+                                },
+                            };
+                        }
+                    });
+                }
             }
 
             let connections = connections.clone();
