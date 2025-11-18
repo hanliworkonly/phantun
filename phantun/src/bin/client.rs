@@ -251,7 +251,7 @@ async fn main() -> io::Result<()> {
 
     if num_streams > 1 {
         info!("Multi-stream mode enabled: {} TCP streams per UDP connection", num_streams);
-        info!("Note: Remote UDP server will see packets from {} different source ports", num_streams);
+        info!("Server will automatically group streams - remote UDP server sees single source port");
     }
 
     let num_cpus = num_cpus::get();
@@ -264,7 +264,7 @@ async fn main() -> io::Result<()> {
         .destination(tun_peer)
         .queues(num_cpus)
         .build()
-        .unwrap();
+        .expect("Failed to create TUN device. Make sure you run with sudo/root privileges and have CAP_NET_ADMIN capability");
 
     if remote_addr.is_ipv6() {
         assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
