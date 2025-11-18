@@ -307,13 +307,23 @@ async fn main() -> io::Result<()> {
             // Create multiple TCP connections for load balancing
             let mut sockets = Vec::with_capacity(num_streams);
             for i in 0..num_streams {
+                debug!("Attempting to create TCP connection {}/{} to {}", i + 1, num_streams, remote_addr);
+
                 let sock = stack.connect(remote_addr).await;
                 if sock.is_none() {
                     error!("Unable to connect to remote {} (stream {}/{})", remote_addr, i + 1, num_streams);
+                    error!("Possible reasons:");
+                    error!("  1. Server not running on {}:{}", remote_addr.ip(), remote_addr.port());
+                    error!("  2. Server DNAT rule not configured (iptables -t nat -A PREROUTING ...)");
+                    error!("  3. Server firewall blocking port {}", remote_addr.port());
+                    error!("  4. Network connectivity issue");
+                    error!("  5. TUN interface not properly configured");
+                    error!("Run './diagnose.sh' for detailed diagnostics");
                     // Clean up any sockets we already created
                     break;
                 }
 
+                debug!("Successfully created TCP connection {}/{}", i + 1, num_streams);
                 let sock = Arc::new(sock.unwrap());
 
                 // Send handshake packet
